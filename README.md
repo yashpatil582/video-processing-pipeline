@@ -1,5 +1,9 @@
 # Scalable Video Processing Pipeline
 
+[![CI](https://github.com/yashpatil582/video-processing-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/yashpatil582/video-processing-pipeline/actions/workflows/ci.yml)
+![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)
+![Python](https://img.shields.io/badge/Python-3.11+-green.svg)
+
 A containerized video ingestion and processing pipeline with message queuing, failure handling, and observability.
 
 ## Architecture
