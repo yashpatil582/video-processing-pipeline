@@ -35,11 +35,11 @@ jobs:
 
       - name: Build Docker images
         run: |
-          docker-compose build
+          docker compose build
 
       - name: Start services
         run: |
-          docker-compose up -d
+          docker compose up -d
           sleep 10
 
       - name: Check service health
@@ -53,14 +53,13 @@ jobs:
           echo "✓ API service healthy"
 
           # Check Redis
-          docker-compose exec -T redis redis-cli ping || exit 1
+          docker compose exec -T redis redis-cli ping || exit 1
           echo "✓ Redis healthy"
 
       - name: Test upload endpoint
         run: |
           # Create a small test video (1 second black screen)
-          docker run --rm -v $(pwd):/work -w /work linuxserver/ffmpeg \
-            -f lavfi -i color=black:s=320x240:d=1 -c:v libx264 /work/test.mp4
+          ffmpeg -f lavfi -i color=black:s=320x240:d=1 -c:v libx264 -t 1 test.mp4 -y
 
           # Upload test video
           RESPONSE=$(curl -s -X POST http://localhost:8000/upload -F "file=@test.mp4")
@@ -71,7 +70,7 @@ jobs:
           echo "Job ID: $JOB_ID"
 
           # Wait for processing
-          sleep 5
+          sleep 15
 
           # Check job status
           curl -s http://localhost:8001/jobs/$JOB_ID
@@ -87,9 +86,9 @@ jobs:
       - name: Show logs on failure
         if: failure()
         run: |
-          docker-compose logs
+          docker compose logs
 
       - name: Stop services
         if: always()
         run: |
-          docker-compose down -v
+          docker compose down -v
