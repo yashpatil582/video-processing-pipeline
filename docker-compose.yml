@@ -1,0 +1,97 @@
+version: '3.8'
+
+services:
+  # Redis for message queue and state management
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Ingestion Service - accepts video uploads
+  ingestion:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - STORAGE_PATH=/app/storage/input
+      - LOG_LEVEL=INFO
+    volumes:
+      - video_storage:/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Worker Pool - processes videos with FFmpeg
+  worker:
+    build:
+      context: ./services/worker
+      dockerfile: Dockerfile
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - INPUT_PATH=/app/storage/input
+      - OUTPUT_PATH=/app/storage/output
+      - WORKER_CONCURRENCY=2
+      - LOG_LEVEL=INFO
+    volumes:
+      - video_storage:/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+
+  # Status API - query job status
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=INFO
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+
+  # Grafana for metrics visualization
+  grafana:
+    image: grafana/grafana:10.0.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  redis_data:
+  video_storage:
+  prometheus_data:
+  grafana_data:
