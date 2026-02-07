@@ -56,6 +56,9 @@ jobs:
           docker compose exec -T redis redis-cli ping || exit 1
           echo "✓ Redis healthy"
 
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Test upload endpoint
         run: |
           # Create a small test video (1 second black screen)
