@@ -248,14 +248,70 @@ class VideoProcessor:
             "error": "; ".join([e["error"] for e in errors]) if errors else None
         }
 
+    async def _should_retry(self, retry_count: int) -> bool:
+        """Check if job should be retried based on retry count."""
+        return retry_count < settings.max_retries
+
+    async def _schedule_retry(self, data: dict, retry_count: int, error: str):
+        """Schedule a job for retry by re-adding to the processing stream."""
+        job_id = data.get("job_id")
+
+        # Wait before retrying (exponential backoff)
+        delay = settings.retry_delay * (2 ** retry_count)
+        logger.info(
+            "Scheduling retry",
+            job_id=job_id,
+            retry_count=retry_count + 1,
+            max_retries=settings.max_retries,
+            delay_seconds=delay
+        )
+
+        await asyncio.sleep(delay)
+
+        # Re-add to stream with incremented retry count
+        retry_data = {**data, "retry_count": str(retry_count + 1)}
+        await self.redis.xadd(PROCESSING_STREAM, retry_data)
+
+        RETRY_COUNTER.inc()
+        logger.info(
+            "Job requeued for retry",
+            job_id=job_id,
+            retry_count=retry_count + 1
+        )
+
+    async def _move_to_dlq(self, job_id: str, message_id: str, error: str, retry_count: int):
+        """Move a failed job to the dead letter queue."""
+        await self.redis.xadd(
+            DEAD_LETTER_STREAM,
+            {
+                "job_id": job_id,
+                "original_message_id": message_id,
+                "error": error,
+                "retry_count": str(retry_count),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+        logger.warning(
+            "Job moved to DLQ after max retries",
+            job_id=job_id,
+            retry_count=retry_count,
+            max_retries=settings.max_retries
+        )
+
     async def handle_message(self, message_id: str, data: dict):
         """Handle a single message from the stream."""
         job_id = data.get("job_id")
         file_path = data.get("file_path")
         source_url = data.get("source_url")
         filename = data.get("filename", "unknown")
+        retry_count = int(data.get("retry_count", 0))
 
-        logger.info("Processing job", job_id=job_id, filename=filename)
+        logger.info(
+            "Processing job",
+            job_id=job_id,
+            filename=filename,
+            retry_count=retry_count
+        )
         ACTIVE_JOBS.inc()
 
         try:
@@ -267,16 +323,27 @@ class VideoProcessor:
                 logger.info("Downloading video", job_id=job_id, url=source_url)
 
                 if not await self.download_video(source_url, file_path):
-                    await self.update_job_status(
-                        job_id, "failed", "Failed to download video"
-                    )
+                    error_msg = "Failed to download video"
+                    # Acknowledge original message first
                     await self.redis.xack(
                         PROCESSING_STREAM, settings.consumer_group, message_id
                     )
+
+                    # Retry or move to DLQ
+                    if await self._should_retry(retry_count):
+                        await self._schedule_retry(data, retry_count, error_msg)
+                    else:
+                        await self.update_job_status(job_id, "failed", error_msg)
+                        await self._move_to_dlq(job_id, message_id, error_msg, retry_count)
                     return
 
             # Process the video
             result = await self.process_video(job_id, file_path, filename)
+
+            # Acknowledge message first
+            await self.redis.xack(
+                PROCESSING_STREAM, settings.consumer_group, message_id
+            )
 
             if result["success"]:
                 await self.update_job_status(
@@ -284,36 +351,30 @@ class VideoProcessor:
                 )
                 logger.info("Job completed", job_id=job_id, outputs=len(result["outputs"]))
             else:
-                await self.update_job_status(
-                    job_id, "failed", error=result["error"], outputs=result["outputs"]
-                )
-                logger.error("Job failed", job_id=job_id, error=result["error"])
-
-            # Acknowledge message
-            await self.redis.xack(
-                PROCESSING_STREAM, settings.consumer_group, message_id
-            )
+                # Processing failed - retry or move to DLQ
+                if await self._should_retry(retry_count):
+                    await self._schedule_retry(data, retry_count, result["error"])
+                else:
+                    await self.update_job_status(
+                        job_id, "failed", error=result["error"], outputs=result["outputs"]
+                    )
+                    await self._move_to_dlq(job_id, message_id, result["error"], retry_count)
 
         except Exception as e:
+            error_msg = str(e)
             logger.exception("Unexpected error processing job", job_id=job_id)
-            await self.update_job_status(job_id, "failed", error=str(e))
 
-            # Move to dead letter queue after max retries
-            # For now, just acknowledge to prevent infinite loop
+            # Acknowledge original message to prevent redelivery
             await self.redis.xack(
                 PROCESSING_STREAM, settings.consumer_group, message_id
             )
 
-            # Add to DLQ
-            await self.redis.xadd(
-                DEAD_LETTER_STREAM,
-                {
-                    "job_id": job_id,
-                    "original_message_id": message_id,
-                    "error": str(e),
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-            )
+            # Retry or move to DLQ
+            if await self._should_retry(retry_count):
+                await self._schedule_retry(data, retry_count, error_msg)
+            else:
+                await self.update_job_status(job_id, "failed", error=error_msg)
+                await self._move_to_dlq(job_id, message_id, error_msg, retry_count)
 
         finally:
             ACTIVE_JOBS.dec()
